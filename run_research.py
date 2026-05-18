@@ -53,6 +53,19 @@ def main():
                     {"role": "human", "content": query}
                 ]
             },
+            "config": {
+                "configurable": {
+                    "research_model": "groq:llama-3.1-8b-instant",
+                    "final_report_model": "groq:llama-3.1-8b-instant",
+                    "compression_model": "groq:llama-3.1-8b-instant",
+                    "summarization_model": "groq:llama-3.1-8b-instant",
+                    "research_model_max_tokens": 1000,
+                    "final_report_model_max_tokens": 1000,
+                    "compression_model_max_tokens": 1000,
+                    "summarization_model_max_tokens": 1000,
+                    "allow_clarification": False
+                }
+            },
             "stream_mode": ["values"],
             "durability": "async"
         }

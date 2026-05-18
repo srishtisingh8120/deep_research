@@ -3,6 +3,19 @@
 import asyncio
 from typing import Literal
 
+import smartllmops
+
+# Initialize the telemetry tracer
+tracer = smartllmops.init()
+
+def smartllmops_trace(span_type, name=None, include_io=True):
+    """Dynamic decorator that wraps with smartllmops if it is active, otherwise does nothing."""
+    def decorator(func):
+        if tracer:
+            return tracer.trace(name=name, span_type=span_type, include_io=include_io)(func)
+        return func
+    return decorator
+
 from langchain.chat_models import init_chat_model
 from langchain_core.messages import (
     AIMessage,
@@ -57,6 +70,7 @@ configurable_model = init_chat_model(
     configurable_fields=("model", "max_tokens", "api_key"),
 )
 
+@smartllmops_trace(span_type="intent-classification", name="Clarify With User")
 async def clarify_with_user(state: AgentState, config: RunnableConfig) -> Command[Literal["write_research_brief", "__end__"]]:
     """Analyze user messages and ask clarifying questions if the research scope is unclear.
     
@@ -70,6 +84,9 @@ async def clarify_with_user(state: AgentState, config: RunnableConfig) -> Comman
     Returns:
         Command to either end with a clarifying question or proceed to research brief
     """
+    if tracer:
+        tracer.start_trace()
+        
     # Step 1: Check if clarification is enabled in configuration
     configurable = Configuration.from_runnable_config(config)
     if not configurable.allow_clarification:
@@ -115,6 +132,7 @@ async def clarify_with_user(state: AgentState, config: RunnableConfig) -> Comman
         )
 
 
+@smartllmops_trace(span_type="chain", name="Write Research Brief")
 async def write_research_brief(state: AgentState, config: RunnableConfig) -> Command[Literal["research_supervisor"]]:
     """Transform user messages into a structured research brief and initialize supervisor.
     
@@ -129,6 +147,9 @@ async def write_research_brief(state: AgentState, config: RunnableConfig) -> Com
     Returns:
         Command to proceed to research supervisor with initialized context
     """
+    if tracer and not smartllmops.sdk._trace_id_var.get():
+        tracer.start_trace()
+
     # Step 1: Set up the research model for structured output
     configurable = Configuration.from_runnable_config(config)
     research_model_config = {
@@ -175,6 +196,7 @@ async def write_research_brief(state: AgentState, config: RunnableConfig) -> Com
     )
 
 
+@smartllmops_trace(span_type="agent", name="Supervisor Agent")
 async def supervisor(state: SupervisorState, config: RunnableConfig) -> Command[Literal["supervisor_tools"]]:
     """Lead research supervisor that plans research strategy and delegates to researchers.
     
@@ -362,6 +384,7 @@ supervisor_builder.add_edge(START, "supervisor")  # Entry point to supervisor
 # Compile supervisor subgraph for use in main workflow
 supervisor_subgraph = supervisor_builder.compile()
 
+@smartllmops_trace(span_type="agent", name="Researcher Agent")
 async def researcher(state: ResearcherState, config: RunnableConfig) -> Command[Literal["researcher_tools"]]:
     """Individual researcher that conducts focused research on specific topics.
     
@@ -426,10 +449,21 @@ async def researcher(state: ResearcherState, config: RunnableConfig) -> Command[
 # Tool Execution Helper Function
 async def execute_tool_safely(tool, args, config):
     """Safely execute a tool with error handling."""
-    try:
-        return await tool.ainvoke(args, config)
-    except Exception as e:
-        return f"Error executing tool: {str(e)}"
+    tool_name = getattr(tool, "name", "unknown_tool")
+    
+    if tracer:
+        @tracer.trace(name=f"Tool: {tool_name}", span_type="tool")
+        async def _run():
+            return await tool.ainvoke(args, config)
+        try:
+            return await _run()
+        except Exception as e:
+            return f"Error executing tool: {str(e)}"
+    else:
+        try:
+            return await tool.ainvoke(args, config)
+        except Exception as e:
+            return f"Error executing tool: {str(e)}"
 
 
 async def researcher_tools(state: ResearcherState, config: RunnableConfig) -> Command[Literal["researcher", "compress_research"]]:
@@ -508,6 +542,7 @@ async def researcher_tools(state: ResearcherState, config: RunnableConfig) -> Co
         update={"researcher_messages": tool_outputs}
     )
 
+@smartllmops_trace(span_type="chain", name="Compress Research")
 async def compress_research(state: ResearcherState, config: RunnableConfig):
     """Compress and synthesize research findings into a concise, structured summary.
     
@@ -604,6 +639,7 @@ researcher_builder.add_edge("compress_research", END)      # Exit point after co
 # Compile researcher subgraph for parallel execution by supervisor
 researcher_subgraph = researcher_builder.compile()
 
+@smartllmops_trace(span_type="llm", name="Final Report Generation")
 async def final_report_generation(state: AgentState, config: RunnableConfig):
     """Generate the final comprehensive research report with retry logic for token limits.
     
@@ -617,6 +653,23 @@ async def final_report_generation(state: AgentState, config: RunnableConfig):
     Returns:
         Dictionary containing the final report and cleared state
     """
+    def export_my_trace(res):
+        if tracer:
+            messages = state.get("messages", [])
+            user_msg = messages[0] if messages else HumanMessage(content="")
+            if isinstance(user_msg, dict):
+                query = user_msg.get("content") or str(user_msg)
+            else:
+                query = getattr(user_msg, "content", str(user_msg))
+            thread_id = config.get("configurable", {}).get("thread_id", "local-run")
+            
+            tracer.export_trace(
+                res,
+                query=query,
+                session_id=thread_id,
+                user_id="open_deep_research_user"
+            )
+
     # Step 1: Extract research findings and prepare state cleanup
     notes = state.get("notes", [])
     cleared_state = {"notes": {"type": "override", "value": []}}
@@ -652,11 +705,13 @@ async def final_report_generation(state: AgentState, config: RunnableConfig):
             ])
             
             # Return successful report generation
-            return {
+            res = {
                 "final_report": final_report.content, 
                 "messages": [final_report],
                 **cleared_state
             }
+            export_my_trace(res)
+            return res
             
         except Exception as e:
             # Handle token limit exceeded errors with progressive truncation
@@ -667,11 +722,13 @@ async def final_report_generation(state: AgentState, config: RunnableConfig):
                     # First retry: determine initial truncation limit
                     model_token_limit = get_model_token_limit(configurable.final_report_model)
                     if not model_token_limit:
-                        return {
+                        res = {
                             "final_report": f"Error generating final report: Token limit exceeded, however, we could not determine the model's maximum context length. Please update the model map in deep_researcher/utils.py with this information. {e}",
                             "messages": [AIMessage(content="Report generation failed due to token limits")],
                             **cleared_state
                         }
+                        export_my_trace(res)
+                        return res
                     # Use 4x token limit as character approximation for truncation
                     findings_token_limit = model_token_limit * 4
                 else:
@@ -683,18 +740,22 @@ async def final_report_generation(state: AgentState, config: RunnableConfig):
                 continue
             else:
                 # Non-token-limit error: return error immediately
-                return {
+                res = {
                     "final_report": f"Error generating final report: {e}",
                     "messages": [AIMessage(content="Report generation failed due to an error")],
                     **cleared_state
                 }
+                export_my_trace(res)
+                return res
     
     # Step 4: Return failure result if all retries exhausted
-    return {
+    res = {
         "final_report": "Error generating final report: Maximum retries exceeded",
         "messages": [AIMessage(content="Report generation failed after maximum retries")],
         **cleared_state
     }
+    export_my_trace(res)
+    return res
 
 # Main Deep Researcher Graph Construction
 # Creates the complete deep research workflow from user input to final report
