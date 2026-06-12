@@ -674,15 +674,24 @@ def is_token_limit_exceeded(exception: Exception, model_name: str = None) -> boo
     """
     error_str = str(exception).lower()
     
+    # Universal check for typical token limit, context limit, and rate limit keywords
+    token_keywords = [
+        'token', 'context', 'length', 'maximum context', 'reduce', 
+        'rate_limit_exceeded', 'context_length_exceeded', 'tpm', 'rpm',
+        'limit exceeded', 'too large', 'resourceexhausted', 'exhausted'
+    ]
+    if any(keyword in error_str for keyword in token_keywords):
+        return True
+    
     # Step 1: Determine provider from model name if available
     provider = None
     if model_name:
         model_str = str(model_name).lower()
-        if model_str.startswith('openai:'):
+        if model_str.startswith('openai:') or model_str.startswith('groq:'):
             provider = 'openai'
         elif model_str.startswith('anthropic:'):
             provider = 'anthropic'
-        elif model_str.startswith('gemini:') or model_str.startswith('google:'):
+        elif model_str.startswith('gemini:') or model_str.startswith('google:') or model_str.startswith('google_genai:'):
             provider = 'gemini'
     
     # Step 2: Check provider-specific token limit patterns
@@ -707,10 +716,12 @@ def _check_openai_token_limit(exception: Exception, error_str: str) -> bool:
     class_name = exception.__class__.__name__
     module_name = getattr(exception.__class__, '__module__', '')
     
-    # Check if this is an OpenAI exception
+    # Check if this is an OpenAI or Groq exception
     is_openai_exception = (
         'openai' in exception_type.lower() or 
-        'openai' in module_name.lower()
+        'openai' in module_name.lower() or
+        'groq' in exception_type.lower() or
+        'groq' in module_name.lower()
     )
     
     # Check for typical OpenAI token limit error types
@@ -805,6 +816,13 @@ MODEL_TOKEN_LIMITS = {
     "google:gemini-1.5-pro": 2097152,
     "google:gemini-1.5-flash": 1048576,
     "google:gemini-pro": 32768,
+    "google_genai:gemini-1.5-pro": 2097152,
+    "google_genai:gemini-1.5-flash": 1048576,
+    "google_genai:gemini-pro": 32768,
+    "google_genai:gemini-2.5-pro": 2097152,
+    "google_genai:gemini-2.5-flash": 1048576,
+    "google_genai:gemini-2-flash": 1048576,
+    "google_genai:gemini-2-flash-lite": 1048576,
     "cohere:command-r-plus": 128000,
     "cohere:command-r": 128000,
     "cohere:command-light": 4096,

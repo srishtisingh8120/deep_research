@@ -8,6 +8,7 @@ import smartllmops
 # Initialize the telemetry tracer
 tracer = smartllmops.init()
 
+
 def smartllmops_trace(span_type, name=None, include_io=True):
     """Dynamic decorator that wraps with smartllmops if it is active, otherwise does nothing."""
     def decorator(func):
@@ -84,9 +85,7 @@ async def clarify_with_user(state: AgentState, config: RunnableConfig) -> Comman
     Returns:
         Command to either end with a clarifying question or proceed to research brief
     """
-    if tracer:
-        tracer.start_trace()
-        
+
     # Step 1: Check if clarification is enabled in configuration
     configurable = Configuration.from_runnable_config(config)
     if not configurable.allow_clarification:
@@ -147,8 +146,6 @@ async def write_research_brief(state: AgentState, config: RunnableConfig) -> Com
     Returns:
         Command to proceed to research supervisor with initialized context
     """
-    if tracer and not smartllmops.sdk._trace_id_var.get():
-        tracer.start_trace()
 
     # Step 1: Set up the research model for structured output
     configurable = Configuration.from_runnable_config(config)
@@ -268,10 +265,16 @@ async def supervisor_tools(state: SupervisorState, config: RunnableConfig) -> Co
     # Define exit criteria for research phase
     exceeded_allowed_iterations = research_iterations > configurable.max_researcher_iterations
     no_tool_calls = not most_recent_message.tool_calls
+    
+    # ResearchComplete is only respected if we are not also calling ConductResearch in parallel
+    has_conduct_research = any(
+        tool_call["name"] == "ConductResearch"
+        for tool_call in most_recent_message.tool_calls
+    )
     research_complete_tool_call = any(
         tool_call["name"] == "ResearchComplete" 
         for tool_call in most_recent_message.tool_calls
-    )
+    ) and not has_conduct_research
     
     # Exit if any termination condition is met
     if exceeded_allowed_iterations or no_tool_calls or research_complete_tool_call:
@@ -353,8 +356,8 @@ async def supervisor_tools(state: SupervisorState, config: RunnableConfig) -> Co
                 
         except Exception as e:
             # Handle research execution errors
-            if is_token_limit_exceeded(e, configurable.research_model) or True:
-                # Token limit exceeded or other error - end research phase
+            if is_token_limit_exceeded(e, configurable.research_model):
+                # Token limit exceeded - end research phase
                 return Command(
                     goto=END,
                     update={
@@ -362,6 +365,9 @@ async def supervisor_tools(state: SupervisorState, config: RunnableConfig) -> Co
                         "research_brief": state.get("research_brief", "")
                     }
                 )
+            else:
+                # Re-raise other errors to propagate and be logged properly
+                raise
     
     # Step 3: Return command with all tool results
     update_payload["supervisor_messages"] = all_tool_messages
